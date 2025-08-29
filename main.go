@@ -16,6 +16,7 @@ import (
 	lru "github.com/hashicorp/golang-lru/v2"
 	ip2location "github.com/ip2location/ip2location-go/v9"
 	"github.com/oschwald/geoip2-golang"
+	"golang.org/x/time/rate"
 )
 
 type Geo struct {
@@ -26,8 +27,8 @@ type Geo struct {
 	City        string  `json:"city,omitempty"`
 	Lat         float64 `json:"lat,omitempty"`
 	Lon         float64 `json:"lon,omitempty"`
-	ASN         uint    `json:"asn,omitempty"` // reserved for future (local ASN DB)
-	Org         string  `json:"org,omitempty"` // reserved for future
+	ASN         uint    `json:"asn,omitempty"`
+	Org         string  `json:"org,omitempty"`
 	Source      string  `json:"source"`
 	LookupMS    int64   `json:"lookup_ms"`
 }
@@ -73,20 +74,17 @@ func (p *IP2LocationProvider) Resolve(ctx context.Context, ip netip.Addr) (*Geo,
 	if err != nil {
 		return nil, err
 	}
-
-	// can't check rec == nil (it's a value). Just validate required fields.
 	if rec.Country_short == "" {
 		return nil, errors.New("no data")
 	}
-
 	out := &Geo{
 		IP:          ip.String(),
 		CountryCode: rec.Country_short,
 		CountryName: rec.Country_long,
 		Region:      rec.Region,
 		City:        rec.City,
-		Lat:         float64(rec.Latitude),  // cast float32 -> float64
-		Lon:         float64(rec.Longitude), // cast float32 -> float64
+		Lat:         float64(rec.Latitude),
+		Lon:         float64(rec.Longitude),
 		Source:      "ip2location",
 	}
 	return out, nil
@@ -126,9 +124,40 @@ func (c *Chain) Resolve(ctx context.Context, ip netip.Addr) (*Geo, error) {
 	return nil, lastErr
 }
 
+type rateLimiter struct {
+	perIP *lru.Cache[string, *rate.Limiter]
+	r     rate.Limit
+	burst int
+}
+
+func newRateLimiter(cacheSize int, rps float64, burst int) *rateLimiter {
+	if cacheSize <= 0 || rps <= 0 || burst <= 0 {
+		return nil
+	}
+	c, _ := lru.New[string, *rate.Limiter](cacheSize)
+	return &rateLimiter{
+		perIP: c,
+		r:     rate.Limit(rps),
+		burst: burst,
+	}
+}
+
+func (rl *rateLimiter) allow(key string) bool {
+	if rl == nil {
+		return true
+	}
+	if lim, ok := rl.perIP.Get(key); ok && lim != nil {
+		return lim.Allow()
+	}
+	lim := rate.NewLimiter(rl.r, rl.burst)
+	rl.perIP.Add(key, lim)
+	return lim.Allow()
+}
+
 var (
 	chain *Chain
 	cfg   Config
+	rl    *rateLimiter
 )
 
 type Config struct {
@@ -139,6 +168,9 @@ type Config struct {
 	AllowPrivateIPs bool
 	CacheSize       int
 	ReqTimeoutMS    int
+	RateRPS         float64
+	RateBurst       int
+	RateCache       int
 }
 
 func main() {
@@ -174,12 +206,13 @@ func main() {
 		cache = c
 	}
 	chain = &Chain{Providers: providers, Cache: cache}
+	rl = newRateLimiter(cfg.RateCache, cfg.RateRPS, cfg.RateBurst)
 
-	http.HandleFunc("/geo", handleGeo)
-	http.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+	http.Handle("/geo", withCORS(http.HandlerFunc(handleGeo)))
+	http.Handle("/healthz", withCORS(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
-	})
+	})))
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
@@ -208,6 +241,10 @@ func handleGeo(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"private or reserved ip not allowed"}`, http.StatusBadRequest)
 		return
 	}
+	if rl != nil && !rl.allow(ip.String()) {
+		http.Error(w, `{"error":"rate limit exceeded"}`, http.StatusTooManyRequests)
+		return
+	}
 
 	start := time.Now()
 	res, err := chain.Resolve(ctx, ip)
@@ -216,18 +253,30 @@ func handleGeo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	res.LookupMS = time.Since(start).Milliseconds()
-	json.NewEncoder(w).Encode(res)
+	_ = json.NewEncoder(w).Encode(res)
+}
+
+func withCORS(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Vary", "Origin")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Requested-With")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
 }
 
 func detectClientIP(r *http.Request, trustXFF bool) (netip.Addr, error) {
-	// 1) explicit ?ip=
 	if raw := r.URL.Query().Get("ip"); raw != "" {
 		if ip, ok := parseIP(raw); ok {
 			return ip, nil
 		}
 		return netip.Addr{}, errors.New("invalid ip in query")
 	}
-	// 2) optionally trust X-Forwarded-For (left-most)
 	if trustXFF {
 		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 			parts := strings.Split(xff, ",")
@@ -236,13 +285,11 @@ func detectClientIP(r *http.Request, trustXFF bool) (netip.Addr, error) {
 			}
 		}
 	}
-	// 3) X-Real-IP
 	if xr := r.Header.Get("X-Real-IP"); xr != "" {
 		if ip, ok := parseIP(strings.TrimSpace(xr)); ok {
 			return ip, nil
 		}
 	}
-	// 4) RemoteAddr
 	host, _, _ := strings.Cut(r.RemoteAddr, ":")
 	if ip, ok := parseIP(host); ok {
 		return ip, nil
@@ -263,35 +310,32 @@ func parseIP(s string) (netip.Addr, bool) {
 }
 
 func isPublic(ip netip.Addr) bool {
-	// loopback, link-local, unspecified
 	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
 		return false
 	}
 	if ip.Is4() {
 		v4 := ip.As4()
-		if v4[0] == 10 { // 10.0.0.0/8
+		if v4[0] == 10 {
 			return false
 		}
-		if v4[0] == 172 && v4[1] >= 16 && v4[1] <= 31 { // 172.16/12
+		if v4[0] == 172 && v4[1] >= 16 && v4[1] <= 31 {
 			return false
 		}
-		if v4[0] == 192 && v4[1] == 168 { // 192.168/16
+		if v4[0] == 192 && v4[1] == 168 {
 			return false
 		}
-		if v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127 { // 100.64/10 CGNAT
+		if v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127 {
 			return false
 		}
-		if v4[0] == 169 && v4[1] == 254 { // 169.254/16
+		if v4[0] == 169 && v4[1] == 254 {
 			return false
 		}
 	}
 	if ip.Is6() {
 		b := ip.As16()
-		// fc00::/7 (ULA)
 		if b[0]&0xfe == 0xfc {
 			return false
 		}
-		// fe80::/10 (link-local)
 		if b[0] == 0xfe && (b[1]&0xc0) == 0x80 {
 			return false
 		}
@@ -307,6 +351,9 @@ func loadConfig() Config {
 	allowPriv := getenvBool("ALLOW_PRIVATE_IPS", false)
 	cacheSize := getenvInt("CACHE_SIZE", 200000)
 	reqTOms := getenvInt("REQ_TIMEOUT_MS", 80)
+	rateRPS := getenvFloat("RATE_RPS", 0)
+	rateBurst := getenvInt("RATE_BURST", 0)
+	rateCache := getenvInt("RATE_CACHE", 100000)
 
 	return Config{
 		Addr:            addr,
@@ -316,6 +363,9 @@ func loadConfig() Config {
 		AllowPrivateIPs: allowPriv,
 		CacheSize:       cacheSize,
 		ReqTimeoutMS:    reqTOms,
+		RateRPS:         rateRPS,
+		RateBurst:       rateBurst,
+		RateCache:       rateCache,
 	}
 }
 
@@ -330,6 +380,15 @@ func getenvInt(key string, def int) int {
 	if v := os.Getenv(key); v != "" {
 		if i, err := strconv.Atoi(v); err == nil {
 			return i
+		}
+	}
+	return def
+}
+
+func getenvFloat(key string, def float64) float64 {
+	if v := os.Getenv(key); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
 		}
 	}
 	return def
